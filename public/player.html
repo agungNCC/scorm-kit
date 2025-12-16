@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <title>SCORM Player - Viewer</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+    <link rel="stylesheet" href="css/styles.css" />
+    <script src="Config.js" type="text/javascript"></script>
+
+    <!-- PDF.js -->
+    <script src="js/pdf.min.js" type="text/javascript"></script>
+    <script>pdfjsLib.GlobalWorkerOptions.workerSrc = "js/pdf.worker.min.js";</script>
+
+    <style>
+        /* ensure same UI look as editor */
+        .viewer {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: calc(100vh - 96px);
+        }
+
+        .canvas-wrapper {
+            width: 100%;
+            height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 12px;
+            box-sizing: border-box;
+        }
+    </style>
+</head>
+
+<body>
+    <!-- TOP BAR -->
+    <div class="topbar">
+        <div class="topbar-menu" id="toggleTocBtn">&#9776;</div>
+        <div id="header-title" class="topbar-title"></div>
+        <div style="margin-left:auto; display:flex; align-items:center; gap:10px;">
+            <div style="font-size:12px; opacity:0.9; color:rgba(255,255,255,0.9);" id="status">ready</div>
+        </div>
+    </div>
+
+    <div class="main-layout">
+        <aside class="sidebar" id="sidebar">
+            <div class="sidebar-header">
+                <span>Table of Contents</span>
+                <span class="sidebar-close" id="closeTocBtn">&times;</span>
+            </div>
+            <ul class="page-list" id="pageList"></ul>
+        </aside>
+
+        <section class="viewer">
+            <div class="canvas-wrapper">
+                <canvas id="pdfCanvas"></canvas>
+            </div>
+        </section>
+    </div>
+
+    <div class="bottombar">
+        <div class="progress-section">
+            <div class="progress-bar-container">
+                <div class="progress-bar-fill" id="progressBarFill"></div>
+            </div>
+            <div class="progress-text" id="progressText">0% completed</div>
+        </div>
+
+        <div class="page-info-wrapper">
+            <button class="nav-btn" id="prevBtn">Prev</button>
+            <span id="pageInfo" class="page-info">Page 1 / 1</span>
+            <button class="nav-btn primary" id="nextBtn">Next</button>
+        </div>
+    </div>
+
+    <!-- SCORM helpers (same as editor) -->
+    <script>
+        let scormAPI = null;
+        let scormVersion = null;
+        function findAPI(win) {
+            let attempts = 0;
+            const maxAttempts = 500;
+            while (!win.API && !win.API_1484_11 && win.parent && win.parent !== win && attempts < maxAttempts) {
+                attempts++; win = win.parent;
+            }
+            if (win.API) { scormVersion = "1.2"; return win.API; }
+            if (win.API_1484_11) { scormVersion = "2004"; return win.API_1484_11; }
+            return null;
+        }
+        function initSCORM() {
+            try { scormAPI = findAPI(window); if (!scormAPI) { console.warn("SCORM API not found. Running standalone."); return; } if (scormVersion === "1.2") scormAPI.LMSInitialize && scormAPI.LMSInitialize(""); else scormAPI.Initialize && scormAPI.Initialize(""); } catch (e) { console.error("SCORM init error", e); }
+        }
+        function getSCORMValue(el12, el2004) { if (!scormAPI) return ""; try { if (scormVersion === "1.2") return scormAPI.LMSGetValue(el12) || ""; else return scormAPI.GetValue(el2004) || ""; } catch (e) { return ""; } }
+        function setSCORMValue(el12, el2004, value) { if (!scormAPI) return; try { if (scormVersion === "1.2") scormAPI.LMSSetValue(el12, String(value)); else scormAPI.SetValue(el2004, String(value)); } catch (e) { } }
+        function commitSCORM() { if (!scormAPI) return; try { if (scormVersion === "1.2") scormAPI.LMSCommit && scormAPI.LMSCommit(""); else scormAPI.Commit && scormAPI.Commit(""); } catch (e) { } }
+        function terminateSCORM() { if (!scormAPI) return; try { if (scormVersion === "1.2") scormAPI.LMSFinish && scormAPI.LMSFinish(""); else scormAPI.Terminate && scormAPI.Terminate(""); } catch (e) { } }
+        window.addEventListener("beforeunload", terminateSCORM);
+
+        function reconcileScormStatus(totalPagesLocal) {
+            if (!scormAPI) return;
+            try {
+                if (scormVersion === "1.2") {
+                    const lessonStatus = scormAPI.LMSGetValue && scormAPI.LMSGetValue("cmi.core.lesson_status") || "";
+                    const suspend = scormAPI.LMSGetValue && scormAPI.LMSGetValue("cmi.suspend_data") || "";
+                    if (lessonStatus === "completed") {
+                        if (!suspend || suspend.length !== totalPagesLocal || /0/.test(suspend)) {
+                            try { scormAPI.LMSSetValue("cmi.core.lesson_status", "incomplete"); scormAPI.LMSCommit && scormAPI.LMSCommit(""); } catch (e) { }
+                        }
+                    }
+                } else {
+                    const lessonStatus = scormAPI.GetValue && scormAPI.GetValue("cmi.completion_status") || "";
+                    const suspend = scormAPI.GetValue && scormAPI.GetValue("cmi.suspend_data") || "";
+                    if (lessonStatus === "completed") {
+                        if (!suspend || suspend.length !== totalPagesLocal || /0/.test(suspend)) {
+                            try { scormAPI.SetValue("cmi.completion_status", "incomplete"); scormAPI.Commit && scormAPI.Commit(""); } catch (e) { }
+                        }
+                    }
+                }
+            } catch (err) { console.warn("reconcileScormStatus error:", err); }
+        }
+    </script>
+
+    <!-- Viewer logic (player) -->
+    <script>
+        let pdfDoc = null;
+        let currentPage = 1;
+        let totalPages = 0;
+        let isRendering = false;
+        let currPage = -1;
+        let visitedPages = [];
+
+        const canvas = document.getElementById("pdfCanvas");
+        const ctx = canvas.getContext("2d");
+        const prevBtn = document.getElementById("prevBtn");
+        const nextBtn = document.getElementById("nextBtn");
+        const pageInfo = document.getElementById("pageInfo");
+        const pageList = document.getElementById("pageList");
+        const progressBarFill = document.getElementById("progressBarFill");
+        const progressText = document.getElementById("progressText");
+        const sidebar = document.getElementById("sidebar");
+        const toggleTocBtn = document.getElementById("toggleTocBtn");
+        const closeTocBtn = document.getElementById("closeTocBtn");
+        const headerTitleEl = document.getElementById("header-title");
+        const canvasWrapper = document.querySelector(".canvas-wrapper");
+        const statusEl = document.getElementById("status");
+
+        if (window.Config && Config.title && headerTitleEl) headerTitleEl.textContent = Config.title;
+        function setStatus(text) { if (statusEl) statusEl.textContent = text; console.log("[ViewerStatus]", text); }
+        function applyConfigStyles() { if (!window.Config) return; const root = document.documentElement; const map = { "--font-family": Config.fontFamily, "--font-size": Config.fontSize, "--font-color": Config.fontColor, "--body-bg": Config.bodyBgColor, "--topbar-bg": Config.headerBgColor, "--topbar-text": Config.headerTextColor, "--bottombar-bg": Config.footerBgColor, "--bottombar-text": Config.footerTextColor, "--nav-btn-bg": Config.buttonBgColor, "--nav-btn-primary-bg": Config.buttonPrimaryBgColor, "--nav-btn-text": Config.buttonTextColor, "--progress-fill": Config.progressBarColor }; Object.keys(map).forEach(k => { const v = map[k]; if (v !== undefined && v !== null) root.style.setProperty(k, v, "important"); }); }
+
+        function updatePageInfo() { pageInfo.textContent = `Page ${currentPage} / ${totalPages}`; }
+        function updateProgressUI() { const visitedCount = visitedPages.filter(Boolean).length; const percent = totalPages ? Math.round((visitedCount / totalPages) * 100) : 0; progressBarFill.style.width = `${percent}%`; progressText.textContent = `${percent}% completed`; }
+
+        function buildPageList() {
+            pageList.innerHTML = "";
+            for (let i = 1; i <= totalPages; i++) {
+                const li = document.createElement("li"); li.className = "page-item"; li.dataset.page = i;
+                const icon = document.createElement("span"); icon.className = "toc-icon"; icon.innerHTML = "&#9776;";
+                const label = document.createElement("span"); label.className = "page-label"; label.textContent = `Slide ${i}`;
+                const status = document.createElement("span"); status.className = "page-status";
+                li.appendChild(icon); li.appendChild(label); li.appendChild(status);
+                li.addEventListener("click", () => { goToPage(i); if (window.innerWidth < 900) closeSidebar(); });
+                pageList.appendChild(li);
+            }
+            refreshPageListStatus();
+        }
+
+        function refreshPageListStatus() {
+            const items = pageList.querySelectorAll(".page-item");
+            items.forEach(item => {
+                const page = parseInt(item.dataset.page, 10);
+                const visited = visitedPages[page - 1] || false;
+                item.classList.toggle("active", page === currentPage);
+                const statusSpan = item.querySelector(".page-status");
+                statusSpan.classList.remove("visited", "not-visited");
+                if (visited) { statusSpan.classList.add("visited"); statusSpan.textContent = "✔"; } else { statusSpan.classList.add("not-visited"); statusSpan.textContent = "●"; }
+            });
+        }
+
+        function renderPage(pageNumber) {
+            if (!pdfDoc || isRendering) return;
+            if (currPage === pageNumber) return;
+            currPage = pageNumber;
+            isRendering = true;
+            pdfDoc.getPage(pageNumber).then(page => {
+                const wrapper = canvasWrapper;
+                const unscaledViewport = page.getViewport({ scale: 1 });
+                const pdfWidth = unscaledViewport.width, pdfHeight = unscaledViewport.height;
+                let scale = Math.min(wrapper.clientWidth / pdfWidth, wrapper.clientHeight / pdfHeight);
+                if (!isFinite(scale) || scale <= 0) scale = 1;
+                const viewport = page.getViewport({ scale });
+                canvas.width = viewport.width; canvas.height = viewport.height;
+                const renderContext = { canvasContext: ctx, viewport: viewport, transform: [1, 0, 0, 1, 0, 0] };
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                page.render(renderContext).promise.then(() => {
+                    isRendering = false; markPageVisited(pageNumber);
+                }).catch(e => { console.error("Render error:", e); isRendering = false; });
+            });
+            prevBtn.disabled = pageNumber <= 1;
+            nextBtn.disabled = pageNumber >= totalPages;
+            updatePageInfo(); refreshPageListStatus();
+        }
+
+        function goToPage(pageNumber) {
+            if (Config.slideSequenceLocked) {
+                // If slides are locked (sequential), ensure the user can only go to the next or previous slide
+
+                if (pageNumber < 1 || pageNumber > totalPages || pageNumber !== currentPage + 1) {
+                    console.log(visitedPages[pageNumber], visitedPages.indexOf(pageNumber) == -1)
+                    if (!visitedPages[pageNumber]) {
+                        return; // Prevent jumping pages if slides are locked
+
+                    }
+                }
+
+            } else {
+                // If slides are unlocked, allow jumping to any page
+                if (pageNumber < 1 || pageNumber > totalPages) {
+                    return; // Ensure valid page range
+                }
+            }
+
+            currentPage = pageNumber;
+            renderPage(currentPage); // Call your render function to load the new page
+
+        }
+
+        function markPageVisited(pageNumber) { if (!visitedPages[pageNumber - 1]) visitedPages[pageNumber - 1] = true; updateProgressUI(); refreshPageListStatus(); saveProgressToSCORM(); }
+
+        function openSidebar() { sidebar.classList.add("open"); }
+        function closeSidebar() { sidebar.classList.remove("open"); }
+        function toggleSidebar() { sidebar.classList.toggle("open"); }
+
+        toggleTocBtn.addEventListener("click", toggleSidebar);
+        closeTocBtn.addEventListener("click", closeSidebar);
+        document.addEventListener("click", (e) => { if (!sidebar.classList.contains("open")) return; const clickInsideSidebar = sidebar.contains(e.target); const clickOnToggle = toggleTocBtn.contains(e.target); if (!clickInsideSidebar && !clickOnToggle && window.innerWidth < 900) closeSidebar(); });
+
+        prevBtn.addEventListener("click", () => { if (currentPage > 1) goToPage(currentPage - 1); });
+        nextBtn.addEventListener("click", () => { if (currentPage < totalPages) goToPage(currentPage + 1); });
+
+        function looksLikePdfByExtension(url) { try { const u = new URL(url); return /\.pdf(\?.*)?$/i.test(u.pathname) || /\.pdf$/i.test(u.pathname); } catch (e) { return /\.pdf(\?.*)?$/i.test(url) || /\.pdf$/i.test(url); } }
+        async function headContentTypeIsPdf(url) { try { const resp = await fetch(url, { method: "HEAD" }); const ct = resp.headers.get("content-type") || ""; return ct.toLowerCase().includes("application/pdf"); } catch (e) { console.warn("HEAD request failed", e); throw e; } }
+        function isSameOrigin(url) { try { const u = new URL(url, window.location.href); return u.origin === window.location.origin; } catch (e) { return false; } }
+
+        async function fetchConvertedPdfUrl(source) {
+            const src = source || (window.Config && Config.pptUrl) || null;
+            if (!src) throw new Error("No source specified");
+            if (src.startsWith("data:") || src.startsWith("blob:")) return src;
+            if (looksLikePdfByExtension(src)) { if (isSameOrigin(src)) { setStatus("Detected PDF (same-origin) — loading directly"); return src; } else { setStatus("Detected PDF (external) — proxying"); return `/proxy?url=${encodeURIComponent(src)}`; } }
+            try { setStatus("Checking content-type of source..."); const isPdf = await headContentTypeIsPdf(src); if (isPdf) { if (isSameOrigin(src)) { setStatus("Detected PDF by content-type — loading directly"); return src; } else { setStatus("Detected PDF by content-type — proxying"); return `/proxy?url=${encodeURIComponent(src)}`; } } } catch (e) { setStatus("Could not verify content-type (CORS?) — will try convert"); }
+            setStatus("Requesting server to convert to PDF...");
+            const resp = await fetch(`/render?url=${encodeURIComponent(src)}`, { method: "GET", headers: { Accept: "application/json" } });
+            if (!resp.ok) { const txt = await resp.text().catch(() => ""); throw new Error(`Server returned ${resp.status} ${txt}`); }
+            const j = await resp.json();
+            if (!j.pdf) throw new Error("Server response missing 'pdf' field");
+            setStatus("Server converted to PDF");
+            return j.pdf;
+        }
+
+        async function startViewerWithPdf(pdfUrl) {
+            try {
+                setStatus("Preparing to load PDF...");
+                const cacheBusted = pdfUrl + (/\?/.test(pdfUrl) ? "&" : "?") + "_=" + Date.now();
+
+                try { if (pdfDoc && typeof pdfDoc.destroy === "function") pdfDoc.destroy(); } catch (e) { }
+                pdfDoc = null; currPage = -1; isRendering = false; currentPage = 1; totalPages = 0; visitedPages = []; ctx.clearRect(0, 0, canvas.width || 0, canvas.height || 0); pageList.innerHTML = ""; updatePageInfo(); updateProgressUI();
+
+                setStatus("Loading PDF...");
+                const loadingTask = pdfjsLib.getDocument(cacheBusted);
+                const pdf = await loadingTask.promise;
+                pdfDoc = pdf;
+                totalPages = pdf.numPages;
+                visitedPages = Array(totalPages).fill(false);
+
+                const shouldOpenSidebar = Config.sidebarDefaultOpen;
+                if (shouldOpenSidebar) {
+                    openSidebar();
+                } else {
+                    closeSidebar();
+                }
+
+
+                initSCORM();
+                try {
+                    const suspend = getSCORMValue("cmi.suspend_data", "cmi.suspend_data");
+                    if (suspend && suspend.length === totalPages) visitedPages = suspend.split("").map(c => c === "1");
+                    else visitedPages = Array(totalPages).fill(false);
+
+                    const lastLocation = parseInt(getSCORMValue("cmi.core.lesson_location", "cmi.location"), 10);
+                    if (!isNaN(lastLocation) && lastLocation >= 1 && lastLocation <= totalPages) currentPage = lastLocation; else currentPage = 1;
+
+                    reconcileScormStatus(totalPages);
+                } catch (e) { console.warn("SCORM restore error", e); }
+
+                buildPageList(); updateProgressUI(); updatePageInfo(); renderPage(currentPage);
+
+                window.lastLoadedPdfUrl = pdfUrl;
+                setStatus("Ready");
+                setTimeout(() => {
+                    setStatus("");
+                }, 1000);
+
+            } catch (err) {
+                console.error("Failed to load PDF:", err);
+                setStatus("Failed to load PDF");
+                ctx.clearRect(0, 0, canvas.width || 0, canvas.height || 0);
+                try { ctx.font = "14px sans-serif"; ctx.fillStyle = "#333"; ctx.fillText("Failed to load PDF.", 10, 30); } catch (e) { }
+            }
+        }
+
+        function saveProgressToSCORM() {
+            if (!totalPages || visitedPages.length !== totalPages) return;
+            const dataString = visitedPages.map(v => v ? "1" : "0").join("");
+            try {
+                setSCORMValue("cmi.suspend_data", "cmi.suspend_data", dataString);
+                setSCORMValue("cmi.core.lesson_location", "cmi.location", String(currentPage));
+                if (visitedPages.every(Boolean)) {
+                    setSCORMValue("cmi.core.lesson_status", "cmi.completion_status", "completed");
+                } else {
+                    const currentStatus = getSCORMValue("cmi.core.lesson_status", "cmi.completion_status");
+                    if (currentStatus === "completed") {
+                        setSCORMValue("cmi.core.lesson_status", "cmi.completion_status", "incomplete");
+                    }
+                }
+                commitSCORM();
+            } catch (e) { console.warn("saveProgressToSCORM error", e); }
+        }
+
+        // INIT player: accept ?pdf= or Config.filename or Config.pptUrl
+        window.addEventListener("load", async () => {
+            applyConfigStyles();
+            try {
+                setStatus("Preparing viewer...");
+                const params = new URLSearchParams(window.location.search);
+                const qpdf = params.get("pdf");
+                let pdfToLoad = null;
+                if (qpdf) pdfToLoad = qpdf;
+                else if (window.Config && Config.filename) pdfToLoad = "data/" + Config.filename;
+                else if (window.Config && Config.pptUrl) pdfToLoad = Config.pptUrl;
+                else throw new Error("No PDF specified for player.");
+
+                const resolvedPdfUrl = await fetchConvertedPdfUrl(pdfToLoad);
+                await startViewerWithPdf(resolvedPdfUrl);
+            } catch (err) {
+                console.error("Initialization error:", err);
+                alert("Error initializing viewer: " + (err.message || err));
+                setStatus("Initialization error");
+            }
+        });
+
+        window.addEventListener("resize", () => { renderPage(currentPage); });
+    </script>
+</body>
+
+</html>
