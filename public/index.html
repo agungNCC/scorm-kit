@@ -3,7 +3,7 @@
 
 <head>
     <meta charset="utf-8" />
-    <title>File Slide Viewer - Editor</title>
+    <title>BAWANA - SCORM KIT</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 
     <link rel="stylesheet" href="css/styles.css" />
@@ -384,9 +384,26 @@
             } catch (e) { console.warn("saveProgressToSCORM error", e); }
         }
 
+        // Fungsi untuk update posisi tombol navigasi dan page number
+        function updateNavPosition() {
+            const pageInfoWrapper = document.querySelector(".page-info-wrapper");
+            if (!pageInfoWrapper || !window.Config) return;
+
+            const position = Config.navPosition || 'center';  // Default ke 'center'
+            //console.log("Setting navPosition to:", position); // Debug log
+
+            pageInfoWrapper.classList.remove('left', 'center', 'right');
+            // Tambahkan kelas baru
+            pageInfoWrapper.classList.add(position);
+
+            //console.log("Updated classes:", pageInfoWrapper.classList);  // Debug log untuk melihat class yang diterapkan
+        }
+
         // INIT on load
         window.addEventListener("load", async () => {
             applyConfigStyles();
+            updateNavPosition();
+
             setTimeout(() => { }, 50);
 
             // ===== Upload Config Modal Logic =====
@@ -418,7 +435,7 @@
             // OK → save config → open file browser
             uploadOkBtn.addEventListener("click", () => {
                 window.UploadConfig = {
-                    title: uploadTitleInput.value || Config.title",
+                    title: uploadTitleInput.value || Config.title,
                     sidebarDefaultOpen: uploadSidebarOpenInput.checked,
                     slideSequenceLocked: uploadSlideLockedInput.checked,
                 };
@@ -523,7 +540,12 @@
             } catch (err) { console.error("Init error:", err); setStatus("Initialization error"); alert("Error initializing viewer: " + (err.message || err)); }
         });
 
-        window.addEventListener("resize", () => { renderPage(currentPage); });
+        window.addEventListener("resize", () => {
+            updateNavPosition(); // Update posisi tombol dan page number
+            renderPage(currentPage);
+
+
+        });
     </script>
 </body>
 
